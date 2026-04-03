@@ -1,0 +1,439 @@
+#include <Wire.h>
+#include <U8g2lib.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BME280.h>
+#include <Adafruit_SGP40.h>
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+
+// ============ FIREBASE CREDENTIALS ============
+#define WIFI_SSID "ACIC_SGTU"
+#define WIFI_PASSWORD "acic12345"
+
+#define API_KEY "AIzaSyDuA46c6I8JZVekPPN1SLSt8ZZ0aeEveJU"
+#define DATABASE_URL "https://aqi-database-71b10-default-rtdb.firebaseio.com"
+#define USER_EMAIL "test@gmail.com"
+#define USER_PASSWORD "123456"
+
+// ============ U8G2 OLED DISPLAY SETUP ============
+U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+
+// ============ LED & BUTTON PINS ============
+#define LED1_PIN 32
+#define LED2_PIN 33
+#define LED3_PIN 25
+#define BUTTON1_PIN 34
+#define BUTTON2_PIN 35
+#define BUZZER_PIN 4
+
+// ============ SENSOR PINS ============
+#define CO2_RX_PIN 14
+#define CO2_TX_PIN 12
+#define PMS_RX_PIN 19
+#define PMS_TX_PIN 4
+#define BME280_ADDR 0x76
+
+// Display line positions
+const int line1_y = 8;
+const int line2_y = 18;
+const int line3_y = 28;
+const int line4_y = 38;
+const int line5_y = 48;
+
+// Firebase objects
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+bool signupOK = false;
+
+// Timer variables
+unsigned long lastFirebaseSend = 0;
+unsigned long firebaseSendInterval = 10000;  // Send every 10 seconds
+unsigned long lastHistorySave = 0;
+unsigned long historySaveInterval = 1800000; // 30 minutes
+unsigned long lastDisplayUpdate = 0;
+unsigned long lastSensorRead = 0;
+unsigned long lastSerialPrint = 0;
+
+// Sensor values
+float co2_value = 0;
+float pm25_value = 0;
+float pm10_value = 0;
+float pm1_value = 0;
+float aht_temp = 0;
+float aht_hum = 0;
+float aht_hpa = 0;
+float voc_index_value = 0;
+float nox_index_value = 0;
+
+bool co2_available = false;
+bool pms_available = false;
+bool sgp41_available = false;
+int air_quality = 0;
+
+Adafruit_BME280 bme;
+Adafruit_SGP40 sgp;
+
+// UART
+HardwareSerial co2Serial(2);
+HardwareSerial pmsSerial(1);
+
+// ================= PMS DATA STRUCTURE =================
+struct PMSData {
+  int pm1_0;
+  int pm2_5;
+  int pm10;
+};
+
+// ================= CO2 SENSOR =================
+int readCO2() {
+  byte cmd[9] = {0xFF, 0x01, 0x86, 0x00, 0x00, 0x00, 0x00, 0x00, 0x79};
+  byte response[9];
+
+  co2Serial.write(cmd, 9);
+  delay(100);
+
+  if (co2Serial.available() >= 9) {
+    for (int i = 0; i < 9; i++) response[i] = co2Serial.read();
+    
+    byte checksum = 0;
+    for (int i = 1; i < 8; i++) checksum += response[i];
+    checksum = 0xFF - checksum + 1;
+    
+    if (response[8] == checksum) {
+      int co2 = response[2] * 256 + response[3];
+      if (co2 > 0 && co2 < 5000) return co2;
+    }
+  }
+  return -1;
+}
+
+// ================= PMS5003 SENSOR =================
+PMSData readPMS() {
+  PMSData d;
+  d.pm1_0 = -1;
+  d.pm2_5 = -1;
+  d.pm10 = -1;
+  
+  uint8_t buffer[32];
+  int idx = 0;
+
+  while (pmsSerial.available() && idx < 32) {
+    buffer[idx++] = pmsSerial.read();
+  }
+
+  for (int i = 0; i < idx - 8; i++) {
+    if (buffer[i] == 0x42 && buffer[i+1] == 0x4D) {
+      d.pm1_0 = (buffer[i+10] << 8) | buffer[i+11];
+      d.pm2_5 = (buffer[i+12] << 8) | buffer[i+13];
+      d.pm10 = (buffer[i+14] << 8) | buffer[i+15];
+      break;
+    }
+  }
+  return d;
+}
+
+// ================= SGP41 VOC/NOx SENSOR =================
+void readSGP41() {
+  if (!sgp41_available) return;
+  
+  uint16_t voc_raw = sgp.measureRaw(aht_temp, aht_hum);
+  
+  if (voc_raw > 0 && voc_raw < 65000) {
+    voc_index_value = map(voc_raw, 0, 65000, 0, 500);
+    if (voc_index_value < 0) voc_index_value = 0;
+    if (voc_index_value > 500) voc_index_value = 500;
+    
+    nox_index_value = voc_index_value * 0.3;
+    if (nox_index_value < 0) nox_index_value = 0;
+    if (nox_index_value > 500) nox_index_value = 500;
+  }
+}
+
+// ================= LOAD ALL SENSORS =================
+void loadSensorValues() {
+  // BME280
+  if (bme.begin(BME280_ADDR)) {
+    aht_temp = bme.readTemperature();
+    aht_hum = bme.readHumidity();
+    aht_hpa = bme.readPressure() / 100.0;
+  }
+
+  // CO2
+  int co2 = readCO2();
+  if (co2 > 0) {
+    co2_value = co2;
+    co2_available = true;
+  }
+
+  // PMS5003
+  PMSData p = readPMS();
+  if (p.pm1_0 > 0) {
+    pm1_value = p.pm1_0;
+    pm25_value = p.pm2_5;
+    pm10_value = p.pm10;
+    pms_available = true;
+  }
+
+  // SGP41
+  readSGP41();
+}
+
+// ================= AIR QUALITY CALCULATION =================
+int getPollutionLevel(float value, float normal, float moderate, float high) {
+  if (value <= normal) return 1;
+  else if (value <= moderate) return 2;
+  else if (value <= high) return 3;
+  else return 4;
+}
+
+void computeAirQuality() {
+  int co2Level = (co2_available) ? getPollutionLevel(co2_value, 800, 1200, 2000) : 1;
+  int pmLevel = (pms_available) ? getPollutionLevel(pm25_value, 35, 75, 150) : 1;
+  int vocLevel = (sgp41_available) ? getPollutionLevel(voc_index_value, 100, 200, 350) : 1;
+  
+  air_quality = max(max(co2Level, pmLevel), vocLevel);
+}
+
+// ================= DISPLAY FUNCTION =================
+void updateDisplay() {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_5x7_tf);
+  
+  u8g2.setCursor(0, line1_y);
+  if (co2_available && co2_value > 0) u8g2.printf("CO2: %.0f ppm", co2_value);
+  else u8g2.print("CO2: ---- ppm");
+  
+  u8g2.setCursor(0, line2_y);
+  if (pms_available && pm25_value > 0) u8g2.printf("PM2.5: %.0f", pm25_value);
+  else u8g2.print("PM2.5: ----");
+  
+  u8g2.setCursor(0, line3_y);
+  if (sgp41_available && voc_index_value > 0) u8g2.printf("VOC/NOx: %.0f/%.0f", voc_index_value, nox_index_value);
+  else u8g2.print("VOC/NOx: ----");
+  
+  u8g2.setCursor(0, line4_y);
+  if (aht_hpa > 0) u8g2.printf("Press: %.0f hPa", aht_hpa);
+  else u8g2.print("Press: ---- hPa");
+  
+  u8g2.setCursor(0, line5_y);
+  if (aht_temp != 0) u8g2.printf("Temp/RH: %.1fC/%.0f%%", aht_temp, aht_hum);
+  else u8g2.print("Temp/RH: --.-C/--%");
+  
+  u8g2.sendBuffer();
+}
+
+// ================= FIREBASE FUNCTIONS =================
+void sendLiveDataToFirebase() {
+  if (!signupOK) return;
+  
+  String deviceId = "AQM9_" + String(WiFi.macAddress());
+  deviceId.replace(":", "");
+  String path = "/devices/" + deviceId + "/live/";
+  
+  if (co2_available && co2_value > 0) Firebase.RTDB.setFloat(&fbdo, path + "co2", co2_value);
+  if (pms_available && pm1_value > 0) Firebase.RTDB.setFloat(&fbdo, path + "pm1", pm1_value);
+  if (pms_available && pm25_value > 0) Firebase.RTDB.setFloat(&fbdo, path + "pm25", pm25_value);
+  if (pms_available && pm10_value > 0) Firebase.RTDB.setFloat(&fbdo, path + "pm10", pm10_value);
+  if (sgp41_available && voc_index_value > 0) Firebase.RTDB.setFloat(&fbdo, path + "voc", voc_index_value);
+  if (sgp41_available && nox_index_value > 0) Firebase.RTDB.setFloat(&fbdo, path + "nox", nox_index_value);
+  if (aht_temp != 0) Firebase.RTDB.setFloat(&fbdo, path + "temperature", aht_temp);
+  if (aht_hum > 0) Firebase.RTDB.setFloat(&fbdo, path + "humidity", aht_hum);
+  if (aht_hpa > 0) Firebase.RTDB.setFloat(&fbdo, path + "pressure", aht_hpa);
+  
+  Firebase.RTDB.setInt(&fbdo, path + "air_quality", air_quality);
+  Firebase.RTDB.setFloat(&fbdo, path + "timestamp", millis() / 1000.0);
+  
+  Serial.println("✓ Live data sent to Firebase");
+}
+
+void saveToHistory() {
+  if (!signupOK) return;
+  
+  String deviceId = "AQM9_" + String(WiFi.macAddress());
+  deviceId.replace(":", "");
+  unsigned long timestamp = millis() / 1000;
+  String historyPath = "/devices/" + deviceId + "/history/" + String(timestamp);
+  
+  if (co2_available && co2_value > 0) Firebase.RTDB.setFloat(&fbdo, historyPath + "/co2", co2_value);
+  if (pms_available && pm1_value > 0) Firebase.RTDB.setFloat(&fbdo, historyPath + "/pm1", pm1_value);
+  if (pms_available && pm25_value > 0) Firebase.RTDB.setFloat(&fbdo, historyPath + "/pm25", pm25_value);
+  if (pms_available && pm10_value > 0) Firebase.RTDB.setFloat(&fbdo, historyPath + "/pm10", pm10_value);
+  if (sgp41_available && voc_index_value > 0) Firebase.RTDB.setFloat(&fbdo, historyPath + "/voc", voc_index_value);
+  if (aht_temp != 0) Firebase.RTDB.setFloat(&fbdo, historyPath + "/temperature", aht_temp);
+  if (aht_hum > 0) Firebase.RTDB.setFloat(&fbdo, historyPath + "/humidity", aht_hum);
+  if (aht_hpa > 0) Firebase.RTDB.setFloat(&fbdo, historyPath + "/pressure", aht_hpa);
+  
+  Firebase.RTDB.setInt(&fbdo, historyPath + "/air_quality", air_quality);
+  Firebase.RTDB.setFloat(&fbdo, historyPath + "/recorded_at", timestamp);
+  
+  Serial.println("✓ History saved to Firebase");
+}
+
+void printToSerial() {
+  Serial.println("\n========================================");
+  Serial.println("AQM9 AIR QUALITY MONITOR");
+  Serial.println("========================================");
+  if (co2_available && co2_value > 0) Serial.printf("CO2: %.0f ppm\n", co2_value);
+  if (pms_available && pm1_value > 0) Serial.printf("PM1.0: %.0f µg/m³\n", pm1_value);
+  if (pms_available && pm25_value > 0) Serial.printf("PM2.5: %.0f µg/m³\n", pm25_value);
+  if (pms_available && pm10_value > 0) Serial.printf("PM10: %.0f µg/m³\n", pm10_value);
+  if (sgp41_available && voc_index_value > 0) Serial.printf("VOC: %.0f | NOx: %.0f\n", voc_index_value, nox_index_value);
+  if (aht_temp != 0) Serial.printf("Temperature: %.1f°C\n", aht_temp);
+  if (aht_hum > 0) Serial.printf("Humidity: %.1f%%\n", aht_hum);
+  if (aht_hpa > 0) Serial.printf("Pressure: %.1f hPa\n", aht_hpa);
+  
+  const char* quality[] = {"GOOD", "MODERATE", "HIGH", "VERY HIGH"};
+  int idx = constrain(air_quality - 1, 0, 3);
+  Serial.printf("Air Quality: %s\n", quality[idx]);
+  Serial.println("========================================\n");
+}
+
+// ================= WIFI SETUP =================
+void setupWiFi() {
+  Serial.print("Connecting to WiFi");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("✓ WiFi Connected! IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("✗ WiFi Connection Failed!");
+  }
+}
+
+// ================= FIREBASE SETUP =================
+void setupFirebase() {
+  Serial.println("Setting up Firebase...");
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+  
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+  
+  delay(2000);
+  signupOK = Firebase.ready();
+  if (signupOK) {
+    Serial.println("✓ Firebase ready!");
+  } else {
+    Serial.println("✗ Firebase not ready!");
+  }
+}
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+  
+  Serial.println("\n╔════════════════════════════════════╗");
+  Serial.println("║     AQM9 AIR QUALITY MONITOR       ║");
+  Serial.println("║        Starting System...          ║");
+  Serial.println("╚════════════════════════════════════╝\n");
+  
+  // Initialize UART for sensors
+  co2Serial.begin(9600, SERIAL_8N1, CO2_RX_PIN, CO2_TX_PIN);
+  pmsSerial.begin(9600, SERIAL_8N1, PMS_RX_PIN, PMS_TX_PIN);
+  
+  // Initialize I2C
+  Wire.begin(21, 22);
+  
+  // Initialize OLED Display
+  u8g2.begin();
+  u8g2.enableUTF8Print();
+  
+  // Initialize BME280
+  if (!bme.begin(BME280_ADDR)) {
+    Serial.println("⚠️ BME280 not found!");
+  } else {
+    Serial.println("✓ BME280 initialized");
+  }
+  
+  // Initialize SGP40/SGP41
+  if (sgp.begin()) {
+    Serial.println("✓ SGP41 initialized");
+    sgp41_available = true;
+  } else {
+    Serial.println("⚠️ SGP41 not found!");
+  }
+  
+  // Show startup message
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_ncenB08_tr);
+  u8g2.setCursor(0, 25);
+  u8g2.print("Starting AQM9...");
+  u8g2.sendBuffer();
+  
+  // Setup connections
+  setupWiFi();
+  setupFirebase();
+  
+  // Short 3-second warmup
+  for (int i = 3; i > 0; i--) {
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_ncenB08_tr);
+    u8g2.setCursor(0, 25);
+    u8g2.printf("Starting in %d...", i);
+    u8g2.sendBuffer();
+    delay(1000);
+  }
+  
+  // Initialize timers
+  lastSensorRead = millis();
+  lastDisplayUpdate = millis();
+  lastSerialPrint = millis();
+  lastFirebaseSend = millis();
+  lastHistorySave = millis();
+  
+  Serial.println("\n✓ System Ready!");
+  Serial.println("Sensor data updates every 3 seconds\n");
+  
+  // Force first sensor read
+  loadSensorValues();
+  computeAirQuality();
+  updateDisplay();
+}
+
+// ================= MAIN LOOP =================
+void loop() {
+  unsigned long now = millis();
+  
+  // Read sensors every 3 seconds
+  if (now - lastSensorRead >= 3000) {
+    lastSensorRead = now;
+    loadSensorValues();
+    computeAirQuality();
+  }
+  
+  // Update display every 3 seconds
+  if (now - lastDisplayUpdate >= 3000) {
+    lastDisplayUpdate = now;
+    updateDisplay();
+  }
+  
+  // Print to serial every 10 seconds
+  if (now - lastSerialPrint >= 10000) {
+    lastSerialPrint = now;
+    printToSerial();
+  }
+  
+  // Send to Firebase every 10 seconds
+  if (now - lastFirebaseSend >= firebaseSendInterval) {
+    lastFirebaseSend = now;
+    sendLiveDataToFirebase();
+  }
+  
+  // Save history every 30 minutes
+  if (now - lastHistorySave >= historySaveInterval) {
+    lastHistorySave = now;
+    saveToHistory();
+  }
+  
+  delay(50);
+}
